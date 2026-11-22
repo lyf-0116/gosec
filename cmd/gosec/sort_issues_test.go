@@ -38,12 +38,23 @@ func firstIsGreater(less, greater *issue.Issue) {
 	ExpectWithOffset(0, slice[0]).To(Equal(greater))
 }
 
+// firstIsBefore checks that two equal-key issues keep their input order,
+// which only a stable sort guarantees.
+func firstIsBefore(first, second *issue.Issue) {
+	slice := []*issue.Issue{first, second}
+
+	sortIssues(slice)
+
+	ExpectWithOffset(0, slice[0]).To(BeIdenticalTo(first))
+	ExpectWithOffset(0, slice[1]).To(BeIdenticalTo(second))
+}
+
 var _ = Describe("Sorting by Severity", func() {
 	It("sorts by severity", func() {
 		less := createIssue()
 		less.Severity = issue.Low
 		greater := createIssue()
-		less.Severity = issue.High
+		greater.Severity = issue.High
 		firstIsGreater(&less, &greater)
 	})
 
@@ -53,7 +64,9 @@ var _ = Describe("Sorting by Severity", func() {
 			less.What = "test1"
 			greater := createIssue()
 			greater.What = "test2"
-			firstIsGreater(&less, &greater)
+			// Tie breakers are ascending: the lexicographically smaller
+			// description must come first even though severity is equal.
+			firstIsBefore(&less, &greater)
 		})
 	})
 
@@ -64,7 +77,7 @@ var _ = Describe("Sorting by Severity", func() {
 			greater := createIssue()
 			greater.File = "test2"
 
-			firstIsGreater(&less, &greater)
+			firstIsBefore(&less, &greater)
 		})
 	})
 
@@ -75,7 +88,7 @@ var _ = Describe("Sorting by Severity", func() {
 			greater := createIssue()
 			greater.Line = "2"
 
-			firstIsGreater(&less, &greater)
+			firstIsBefore(&less, &greater)
 		})
 
 		It("handles line ranges correctly", func() {
@@ -84,19 +97,16 @@ var _ = Describe("Sorting by Severity", func() {
 			greater := createIssue()
 			greater.Line = "15-20"
 
-			firstIsGreater(&less, &greater)
+			firstIsBefore(&less, &greater)
 		})
 
-		It("compares start line in ranges", func() {
+		It("keeps input order when start lines in ranges are equal", func() {
 			less := createIssue()
 			less.Line = "10-15"
 			greater := createIssue()
 			greater.Line = "10-20"
 
-			// When start lines are equal, order is preserved (stable sort)
-			slice := []*issue.Issue{&less, &greater}
-			sortIssues(slice)
-			// Both have same start line, so order based on earlier criteria
+			firstIsBefore(&less, &greater)
 		})
 
 		It("handles single line vs range", func() {
@@ -105,7 +115,18 @@ var _ = Describe("Sorting by Severity", func() {
 			greater := createIssue()
 			greater.Line = "10-15"
 
-			firstIsGreater(&less, &greater)
+			firstIsBefore(&less, &greater)
+		})
+	})
+
+	Context("Severity is same and all tie breakers are equal", func() {
+		It("sorts by rule ID in ascending order", func() {
+			less := createIssue()
+			less.RuleID = "G101"
+			greater := createIssue()
+			greater.RuleID = "G102"
+
+			firstIsBefore(&less, &greater)
 		})
 	})
 })
@@ -149,13 +170,23 @@ var _ = Describe("Sorting multiple issues", func() {
 
 		sortIssues(issues)
 
-		// First should be High severity
+		// Severity is descending, all remaining keys are ascending.
 		Expect(issues[0].Severity).To(Equal(issue.High))
-		// Within High severity, sorted by What (descending), then File, then Line
-		// "error2" > "error1" alphabetically, so error2 comes first
-		Expect(issues[0].What).To(Equal("error2"))
+		Expect(issues[1].Severity).To(Equal(issue.High))
+		Expect(issues[2].Severity).To(Equal(issue.High))
+		Expect(issues[3].Severity).To(Equal(issue.Medium))
+		Expect(issues[4].Severity).To(Equal(issue.Low))
+
+		// Within High severity: What then File then Line are ascending.
+		Expect(issues[0].What).To(Equal("error1"))
 		Expect(issues[0].File).To(Equal("file1.go"))
-		Expect(issues[0].Line).To(Equal("1"))
+		Expect(issues[0].Line).To(Equal("5"))
+		Expect(issues[1].What).To(Equal("error1"))
+		Expect(issues[1].File).To(Equal("file2.go"))
+		Expect(issues[1].Line).To(Equal("3"))
+		Expect(issues[2].What).To(Equal("error2"))
+		Expect(issues[2].File).To(Equal("file1.go"))
+		Expect(issues[2].Line).To(Equal("1"))
 	})
 
 	It("handles empty slice", func() {
@@ -181,6 +212,22 @@ var _ = Describe("Sorting multiple issues", func() {
 		sortIssues(issues)
 
 		Expect(issues).To(HaveLen(2))
+		Expect(issues[0]).To(BeIdenticalTo(&issue1))
+		Expect(issues[1]).To(BeIdenticalTo(&issue2))
+	})
+
+	It("maintains stability when equal keys are interleaved", func() {
+		issue1 := createIssue()
+		issue2 := createIssue()
+		issue3 := createIssue()
+		issue3.Severity = issue.Low
+		issues := []*issue.Issue{&issue1, &issue3, &issue2}
+
+		sortIssues(issues)
+
+		Expect(issues[0]).To(BeIdenticalTo(&issue1))
+		Expect(issues[1]).To(BeIdenticalTo(&issue2))
+		Expect(issues[2]).To(BeIdenticalTo(&issue3))
 	})
 
 	It("sorts issues with different severity levels", func() {
@@ -197,5 +244,69 @@ var _ = Describe("Sorting multiple issues", func() {
 		Expect(issues[0].Severity).To(Equal(issue.High))
 		Expect(issues[1].Severity).To(Equal(issue.Medium))
 		Expect(issues[2].Severity).To(Equal(issue.Low))
+	})
+})
+
+var _ = Describe("dedupIssues", func() {
+	It("removes identical findings produced by multiple taint paths", func() {
+		first := createIssue()
+		duplicate := createIssue()
+		issues := []*issue.Issue{&first, &duplicate}
+
+		result := dedupIssues(issues)
+
+		Expect(result).To(HaveLen(1))
+		Expect(result[0]).To(BeIdenticalTo(&first))
+	})
+
+	It("keeps distinct findings on the same line and rule when reasons differ", func() {
+		first := createIssue()
+		first.What = "first reason"
+		second := createIssue()
+		second.What = "second reason"
+		issues := []*issue.Issue{&first, &second}
+
+		result := dedupIssues(issues)
+
+		Expect(result).To(HaveLen(2))
+		Expect(result[0]).To(BeIdenticalTo(&first))
+		Expect(result[1]).To(BeIdenticalTo(&second))
+	})
+
+	It("keeps findings that differ in any reported field", func() {
+		base := createIssue()
+
+		otherLine := createIssue()
+		otherLine.Line = "2"
+		otherRule := createIssue()
+		otherRule.RuleID = "G104"
+		otherSeverity := createIssue()
+		otherSeverity.Severity = issue.Low
+
+		issues := []*issue.Issue{&base, &otherLine, &otherRule, &otherSeverity, &base}
+
+		result := dedupIssues(issues)
+
+		Expect(result).To(HaveLen(4))
+		Expect(result[0]).To(BeIdenticalTo(&base))
+	})
+
+	It("preserves the first occurrence when duplicates are interleaved", func() {
+		first := createIssue()
+		other := createIssue()
+		other.Line = "9"
+		duplicate := createIssue()
+		issues := []*issue.Issue{&first, &other, &duplicate}
+
+		result := dedupIssues(issues)
+
+		Expect(result).To(HaveLen(2))
+		Expect(result[0]).To(BeIdenticalTo(&first))
+		Expect(result[1]).To(BeIdenticalTo(&other))
+	})
+
+	It("handles empty and nil inputs", func() {
+		Expect(dedupIssues(nil)).To(BeEmpty())
+		Expect(dedupIssues([]*issue.Issue{})).To(BeEmpty())
 	})
 })

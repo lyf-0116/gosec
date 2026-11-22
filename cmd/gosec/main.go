@@ -563,6 +563,10 @@ func run() int {
 		logger.Printf("Excluded %d issues by path-based rules", pathExcludedCount)
 	}
 
+	// Remove identical findings (e.g. one sink hit by multiple taint paths)
+	// before sorting and before the gate counts the remaining issues.
+	issues = dedupIssues(issues)
+
 	// Sort the issue by severity
 	if *flagSortIssues {
 		sortIssues(issues)
