@@ -201,6 +201,7 @@ type Analyzer struct {
 	trackSuppressions bool
 	concurrency       int
 	analyzerSet       *analyzers.AnalyzerSet
+	pathFilter        *PathExclusionFilter
 }
 
 // NewAnalyzer builds a new analyzer.
@@ -237,6 +238,13 @@ func NewAnalyzer(conf Config, tests bool, excludeGenerated bool, trackSuppressio
 // SetConfig updates the analyzer configuration
 func (gosec *Analyzer) SetConfig(conf Config) {
 	gosec.config = conf
+}
+
+// SetPathExclusionFilter installs the path-based exclusion filter. Issues are
+// filtered when they are produced, so excluded findings never enter the issue
+// list or the scan metrics.
+func (gosec *Analyzer) SetPathExclusionFilter(filter *PathExclusionFilter) {
+	gosec.pathFilter = filter
 }
 
 // Config returns the current configuration
@@ -1076,6 +1084,11 @@ func (v *astVisitor) reportInvalidDirective(group *ast.CommentGroup, reason stri
 // updateIssues updates the issues list with the given issue, handling suppressions.
 func (gosec *Analyzer) updateIssues(issue *issue.Issue, issues []*issue.Issue, stats *Metrics, allIgnores ignores) []*issue.Issue {
 	if issue != nil {
+		// Path-based exclusions are applied before metrics and suppression
+		// bookkeeping, keeping NumFound consistent with the reported issues.
+		if gosec.pathFilter != nil && gosec.pathFilter.ShouldExclude(issue.File, issue.RuleID) {
+			return issues
+		}
 		suppressions, ignored := getSuppressions(allIgnores, issue.File, issue.Line, issue.RuleID, gosec.ruleset, gosec.analyzerSet)
 		if gosec.showIgnored {
 			issue.NoSec = ignored

@@ -397,11 +397,9 @@ func buildPathExclusionFilter(config gosec.Config, cliFlag string) (*gosec.PathE
 		return nil, fmt.Errorf("invalid exclude-rules in config: %w", err)
 	}
 
-	// Merge rules (CLI takes precedence)
-	allRules := gosec.MergeExcludeRules(configRules, cliRules)
-
-	// Create and return filter
-	return gosec.NewPathExclusionFilter(allRules)
+	// Keep CLI and config rules in separate groups so CLI rules can shadow
+	// (and therefore narrow) broad configuration exclusions per path.
+	return gosec.NewPathExclusionFilterWithRules(configRules, cliRules)
 }
 
 func main() {
@@ -529,6 +527,17 @@ func run() int {
 	if len(paths) == 0 {
 		paths = append(paths, "./...")
 	}
+
+	// Anchor exclusion patterns on paths relative to the scan roots. The
+	// same arguments drive both root resolution and package discovery.
+	scanRoots, err := getRootPaths(paths)
+	if err != nil {
+		logger.Printf("Failed to get root paths: %v", err)
+		return exitFailure
+	}
+	pathFilter.SetScanRoots(scanRoots...)
+	analyzer.SetPathExclusionFilter(pathFilter)
+
 	for _, path := range paths {
 		pcks, err := gosec.PackagePaths(path, excludedDirs)
 		if err != nil {
@@ -556,10 +565,9 @@ func run() int {
 	// Collect the results
 	issues, metrics, errors := analyzer.Report()
 
-	// Apply path-based exclusions first
-	var pathExcludedCount int
-	issues, pathExcludedCount = pathFilter.FilterIssues(issues)
-	if pathExcludedCount > 0 {
+	// Path-based exclusions already run inside the analyzer, so the metrics
+	// only account for the reported issues.
+	if pathExcludedCount := pathFilter.ExcludedCount(); pathExcludedCount > 0 {
 		logger.Printf("Excluded %d issues by path-based rules", pathExcludedCount)
 	}
 
@@ -581,12 +589,6 @@ func run() int {
 	}
 
 	// Create output report
-	rootPaths, err := getRootPaths(flag.Args())
-	if err != nil {
-		logger.Printf("Failed to get root paths: %v", err)
-		return exitFailure
-	}
-
 	reportInfo := gosec.NewReportInfo(issues, metrics, errors).WithVersion(Version)
 
 	// Call AI request to solve the issues
@@ -616,13 +618,13 @@ func run() int {
 
 	if *flagOutput == "" || *flagStdOut {
 		fileFormat := getPrintedFormat(*flagFormat, *flagVerbose)
-		if err := printReport(fileFormat, *flagColor, rootPaths, reportInfo); err != nil {
+		if err := printReport(fileFormat, *flagColor, scanRoots, reportInfo); err != nil {
 			logger.Printf("Failed to print report: %v", err)
 			return exitFailure
 		}
 	}
 	if *flagOutput != "" {
-		if err := saveReport(*flagOutput, *flagFormat, rootPaths, reportInfo); err != nil {
+		if err := saveReport(*flagOutput, *flagFormat, scanRoots, reportInfo); err != nil {
 			logger.Printf("Failed to save report: %v", err)
 			return exitFailure
 		}

@@ -327,6 +327,23 @@ gosec --exclude-rules="cmd/.*:G204,G304;test/.*:G101" ./...
 | `path` | string (regex) | Regex matched against file paths |
 | `rules` | []string | Rule IDs to exclude. `*` for all |
 
+**Matching baseline:** patterns are matched against file paths relative to the
+scan root (for example `cmd/tool/main.go`), never against the absolute path
+reported by the analyzer. Anchor a pattern with `^` to restrict it to the root
+of the scan; without an anchor, patterns match at any directory boundary, so
+`cmd/.*` matches both `cmd/tool/main.go` and `pkg/cmd/helper.go`, while
+`^cmd/.*` only matches the former. A leading slash (`/cmd/.*` or `^/cmd/.*`)
+refers to the scan root and is equivalent to omitting it. When several scan
+roots are provided, the most specific root containing each file is used; files
+outside every root are never excluded, avoiding missed findings.
+
+**CLI precedence:** rules from `--exclude-rules` take precedence over the
+configuration file. If any CLI rule matches a file's path, configuration rules
+are not evaluated for that file at all. This lets the CLI narrow a broad
+configuration exclusion: a config entry `{"path": "cmd/.*", "rules": ["*"]}`
+combined with `--exclude-rules="cmd/.*:G204"` reports every rule except `G204`
+under `cmd/` instead of suppressing the whole directory.
+
 #### Rule Configuration
 
 Some rules accept configuration flags as well; these flags are

@@ -31,6 +31,40 @@ func TestCheckAnalyzersShortCircuitsWithoutAnalyzers(t *testing.T) {
 	}
 }
 
+func TestPathExclusionFilterRunsBeforeMetrics(t *testing.T) {
+	t.Parallel()
+
+	filter, err := NewPathExclusionFilter([]PathExcludeRule{
+		{Path: `^cmd/`, Rules: []string{"G204"}},
+	})
+	if err != nil {
+		t.Fatalf("unexpected filter error: %v", err)
+	}
+
+	a := NewAnalyzer(NewConfig(), false, false, false, 1, log.New(io.Discard, "", 0))
+	a.SetPathExclusionFilter(filter)
+
+	stats := &Metrics{}
+	excluded := &issue.Issue{File: "cmd/main.go", RuleID: "G204"}
+	reported := &issue.Issue{File: "cmd/main.go", RuleID: "G304"}
+
+	issues := a.updateIssues(excluded, nil, stats, nil)
+	issues = a.updateIssues(reported, issues, stats, nil)
+
+	if len(issues) != 1 {
+		t.Fatalf("expected only the non-excluded issue, got %d", len(issues))
+	}
+	if issues[0].RuleID != "G304" {
+		t.Fatalf("unexpected surviving rule ID: %s", issues[0].RuleID)
+	}
+	if stats.NumFound != 1 {
+		t.Fatalf("excluded issue must not be counted, NumFound = %d", stats.NumFound)
+	}
+	if filter.ExcludedCount() != 1 {
+		t.Fatalf("expected one exclusion, got %d", filter.ExcludedCount())
+	}
+}
+
 func TestCheckAnalyzersHandlesSSABuildFailure(t *testing.T) {
 	t.Parallel()
 

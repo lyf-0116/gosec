@@ -1,6 +1,8 @@
 package gosec_test
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -294,37 +296,152 @@ var _ = Describe("PathExclusionFilter", func() {
 		})
 	})
 
-	Describe("MergeExcludeRules", func() {
-		It("should merge CLI and config rules with CLI first", func() {
-			cliRules := []gosec.PathExcludeRule{
-				{Path: "cli/.*", Rules: []string{"G204"}},
-			}
+	Describe("CLI precedence", func() {
+		It("should narrow a broad config exclusion with a more specific CLI rule", func() {
 			configRules := []gosec.PathExcludeRule{
-				{Path: "config/.*", Rules: []string{"G304"}},
+				{Path: "cmd/.*", Rules: []string{"*"}},
+			}
+			cliRules := []gosec.PathExcludeRule{
+				{Path: "cmd/.*", Rules: []string{"G204"}},
 			}
 
-			merged := gosec.MergeExcludeRules(configRules, cliRules)
-			Expect(merged).To(HaveLen(2))
-			Expect(merged[0].Path).To(Equal("cli/.*")) // CLI first
-			Expect(merged[1].Path).To(Equal("config/.*"))
+			filter, err := gosec.NewPathExclusionFilterWithRules(configRules, cliRules)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Only the CLI rule applies on this path: G204 excluded, others reported.
+			Expect(filter.ShouldExclude("cmd/main.go", "G204")).To(BeTrue())
+			Expect(filter.ShouldExclude("cmd/main.go", "G304")).To(BeFalse())
+			Expect(filter.ShouldExclude("cmd/main.go", "G101")).To(BeFalse())
 		})
 
-		It("should handle empty CLI rules", func() {
+		It("should keep config exclusions for paths not named by CLI rules", func() {
 			configRules := []gosec.PathExcludeRule{
-				{Path: "config/.*", Rules: []string{"G304"}},
+				{Path: "cmd/.*", Rules: []string{"*"}},
+			}
+			cliRules := []gosec.PathExcludeRule{
+				{Path: "scripts/.*", Rules: []string{"G101"}},
 			}
 
-			merged := gosec.MergeExcludeRules(configRules, nil)
-			Expect(merged).To(Equal(configRules))
+			filter, err := gosec.NewPathExclusionFilterWithRules(configRules, cliRules)
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(filter.ShouldExclude("cmd/main.go", "G304")).To(BeTrue())
+			Expect(filter.ShouldExclude("scripts/build.go", "G101")).To(BeTrue())
+			Expect(filter.ShouldExclude("scripts/build.go", "G304")).To(BeFalse())
 		})
 
-		It("should handle empty config rules", func() {
+		It("should report everything when the CLI rule names the path without excluding the rule", func() {
+			configRules := []gosec.PathExcludeRule{
+				{Path: "cmd/.*", Rules: []string{"*"}},
+			}
 			cliRules := []gosec.PathExcludeRule{
-				{Path: "cli/.*", Rules: []string{"G204"}},
+				{Path: "cmd/.*", Rules: []string{"G999"}},
 			}
 
-			merged := gosec.MergeExcludeRules(nil, cliRules)
-			Expect(merged).To(Equal(cliRules))
+			filter, err := gosec.NewPathExclusionFilterWithRules(configRules, cliRules)
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(filter.ShouldExclude("cmd/main.go", "G101")).To(BeFalse())
+			Expect(filter.ShouldExclude("cmd/main.go", "G304")).To(BeFalse())
+		})
+	})
+
+	Describe("scan root anchoring", func() {
+		var root string
+
+		BeforeEach(func() {
+			var err error
+			root, err = os.MkdirTemp("", "gosec-path-filter")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(os.MkdirAll(filepath.Join(root, "cmd", "tool"), 0o755)).To(Succeed())
+			Expect(os.MkdirAll(filepath.Join(root, "pkg", "cmd"), 0o755)).To(Succeed())
+			Expect(os.WriteFile(filepath.Join(root, "cmd", "tool", "main.go"), []byte("package main"), 0o600)).To(Succeed())
+			Expect(os.WriteFile(filepath.Join(root, "pkg", "cmd", "helper.go"), []byte("package cmd"), 0o600)).To(Succeed())
+		})
+
+		AfterEach(func() {
+			Expect(os.RemoveAll(root)).To(Succeed())
+		})
+
+		newRootedFilter := func(rules []gosec.PathExcludeRule) *gosec.PathExclusionFilter {
+			filter, err := gosec.NewPathExclusionFilter(rules)
+			Expect(err).NotTo(HaveOccurred())
+			filter.SetScanRoots(root)
+			return filter
+		}
+
+		It("should match anchored patterns against the root-relative path", func() {
+			filter := newRootedFilter([]gosec.PathExcludeRule{
+				{Path: `^cmd/`, Rules: []string{"G204"}},
+			})
+
+			Expect(filter.ShouldExclude(filepath.Join(root, "cmd", "tool", "main.go"), "G204")).To(BeTrue())
+			// A directory named cmd nested elsewhere must not match the anchored pattern.
+			Expect(filter.ShouldExclude(filepath.Join(root, "pkg", "cmd", "helper.go"), "G204")).To(BeFalse())
+		})
+
+		It("should treat a leading slash as the scan root rather than the filesystem root", func() {
+			filter := newRootedFilter([]gosec.PathExcludeRule{
+				{Path: `^/cmd/.*`, Rules: []string{"G304"}},
+			})
+
+			Expect(filter.ShouldExclude(filepath.Join(root, "cmd", "tool", "main.go"), "G304")).To(BeTrue())
+		})
+
+		It("should keep unanchored rules on directory boundaries and explicit anchors strict", func() {
+			filter := newRootedFilter([]gosec.PathExcludeRule{
+				// No anchor: matches a cmd segment anywhere below the root.
+				{Path: `cmd/.*`, Rules: []string{"G204"}},
+				// Explicit anchor: only cmd at the scan root matches.
+				{Path: `^cmd/.*`, Rules: []string{"G304"}},
+			})
+
+			Expect(filter.ShouldExclude(filepath.Join(root, "cmd", "tool", "main.go"), "G204")).To(BeTrue())
+			Expect(filter.ShouldExclude(filepath.Join(root, "cmd", "tool", "main.go"), "G304")).To(BeTrue())
+			Expect(filter.ShouldExclude(filepath.Join(root, "pkg", "cmd", "helper.go"), "G204")).To(BeTrue())
+			Expect(filter.ShouldExclude(filepath.Join(root, "pkg", "cmd", "helper.go"), "G304")).To(BeFalse())
+		})
+
+		It("should never exclude files outside every scan root", func() {
+			otherRoot, err := os.MkdirTemp("", "gosec-path-filter-other")
+			Expect(err).NotTo(HaveOccurred())
+			defer func() { Expect(os.RemoveAll(otherRoot)).To(Succeed()) }()
+			target := filepath.Join(otherRoot, "cmd", "main.go")
+			Expect(os.MkdirAll(filepath.Dir(target), 0o755)).To(Succeed())
+			Expect(os.WriteFile(target, []byte("package main"), 0o600)).To(Succeed())
+
+			filter := newRootedFilter([]gosec.PathExcludeRule{
+				{Path: "cmd/.*", Rules: []string{"*"}},
+			})
+
+			Expect(filter.ShouldExclude(target, "G101")).To(BeFalse())
+		})
+
+		It("should select the most specific root in a multi-root scan", func() {
+			nestedRoot := filepath.Join(root, "cmd")
+			filter, err := gosec.NewPathExclusionFilter([]gosec.PathExcludeRule{
+				{Path: `^tool/.*`, Rules: []string{"G204"}},
+			})
+			Expect(err).NotTo(HaveOccurred())
+			filter.SetScanRoots(root, nestedRoot)
+
+			// Relative to the nested root the file is tool/main.go, so it matches.
+			Expect(filter.ShouldExclude(filepath.Join(nestedRoot, "tool", "main.go"), "G204")).To(BeTrue())
+			// Relative to the outer root the file is cmd/tool/main.go, which the
+			// anchored pattern must not match; picking the wrong root would leak.
+			Expect(filter.ShouldExclude(filepath.Join(root, "pkg", "cmd", "helper.go"), "G204")).To(BeFalse())
+		})
+
+		It("should count exclusions and allow resetting the counter", func() {
+			filter := newRootedFilter([]gosec.PathExcludeRule{
+				{Path: "cmd/.*", Rules: []string{"G204"}},
+			})
+
+			Expect(filter.ShouldExclude(filepath.Join(root, "cmd", "tool", "main.go"), "G204")).To(BeTrue())
+			Expect(filter.ShouldExclude(filepath.Join(root, "cmd", "tool", "main.go"), "G101")).To(BeFalse())
+			Expect(filter.ExcludedCount()).To(Equal(int64(1)))
+			filter.ResetExcludedCount()
+			Expect(filter.ExcludedCount()).To(Equal(int64(0)))
 		})
 	})
 })
