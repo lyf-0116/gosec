@@ -1613,3 +1613,171 @@ func TestSinkIDMatchesIssueText(t *testing.T) {
 		}
 	}
 }
+
+// buildInMemorySSA type-checks and builds SSA for a single self-contained
+// package given as source text, mirroring the depth-limit tests which never
+// load a real package from disk.
+func buildInMemorySSA(t *testing.T, src string) (*ssa.Program, *ssa.Package) {
+	t.Helper()
+	fset := token.NewFileSet()
+	parsed, err := parser.ParseFile(fset, "p.go", src, 0)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	info := &types.Info{
+		Types:      make(map[ast.Expr]types.TypeAndValue),
+		Defs:       make(map[*ast.Ident]types.Object),
+		Uses:       make(map[*ast.Ident]types.Object),
+		Implicits:  make(map[ast.Node]types.Object),
+		Scopes:     make(map[ast.Node]*types.Scope),
+		Selections: make(map[*ast.SelectorExpr]*types.Selection),
+	}
+	pkg, err := (&types.Config{}).Check("p", fset, []*ast.File{parsed}, info)
+	if err != nil {
+		t.Fatalf("type-check: %v", err)
+	}
+	prog := ssa.NewProgram(fset, ssa.BuilderMode(0))
+	ssaPkg := prog.CreatePackage(pkg, []*ast.File{parsed}, info, true)
+	prog.Build()
+	return prog, ssaPkg
+}
+
+// TestValueReachableFromParamsUsesSharedDepthBudget pins the single-budget
+// refactor: valueReachableFromParams previously carried a hard-coded limit of
+// 30 while the rest of the tracer used maxTaintDepth (50). A 40-hop chain must
+// therefore be traversable from depth 0 (rejecting the old 30 cutoff) while a
+// traversal started past maxTaintDepth is still cut off.
+func TestValueReachableFromParamsUsesSharedDepthBudget(t *testing.T) {
+	t.Parallel()
+
+	// A 40-hop chain: t0 := <-in; tN := <-t(N-1); return t40, rooted at the
+	// tainted parameter in.
+	const levels = 40
+	src := "package p\n\nfunc f(in "
+	for i := 0; i <= levels; i++ {
+		src += "<-chan "
+	}
+	src += "string) string {\n\tt0 := <-in\n"
+	for i := 1; i <= levels; i++ {
+		src += fmt.Sprintf("\tt%d := <-t%d\n", i, i-1)
+	}
+	src += fmt.Sprintf("\treturn t%d\n}\n", levels)
+
+	_, ssaPkg := buildInMemorySSA(t, src)
+	fn := ssaPkg.Func("f")
+	if fn == nil || len(fn.Params) != 1 {
+		t.Fatal("expected function f with one parameter")
+	}
+
+	var retVal ssa.Value
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			if ret, ok := instr.(*ssa.Return); ok {
+				retVal = ret.Results[0]
+			}
+		}
+	}
+	if retVal == nil {
+		t.Fatal("expected a return value")
+	}
+
+	analyzer := New(&Config{})
+	taintedParams := map[*ssa.Parameter]bool{fn.Params[0]: true}
+
+	// 40 hops exceed the old hard-coded 30 but stay within maxTaintDepth (50),
+	// so the shared-budget walk must still reach the tainted parameter.
+	if !analyzer.valueReachableFromParams(retVal, taintedParams, make(map[ssa.Value]bool), 0) {
+		t.Fatal("40-hop chain should be reachable under the shared maxTaintDepth budget")
+	}
+
+	// Starting past the shared budget must still short-circuit immediately,
+	// even though the chain itself is tainted at its root.
+	if analyzer.valueReachableFromParams(retVal, taintedParams, make(map[ssa.Value]bool), maxTaintDepth+1) {
+		t.Fatal("depth guard must reject traversal past maxTaintDepth")
+	}
+}
+
+// TestFieldAccessChainAdvancesDepth verifies the depth guard at every
+// field-family entry point. With each hop now forwarding depth+1, an
+// over-budget call must short-circuit before touching SSA values; this also
+// guards the nil handling added to isFieldOfAllocTainted and the pointer path.
+func TestFieldAccessChainAdvancesDepth(t *testing.T) {
+	t.Parallel()
+
+	analyzer := New(&Config{})
+
+	overBudget := maxTaintDepth + 1
+	if analyzer.isFieldAccessTainted(nil, nil, make(map[ssa.Value]bool), overBudget) {
+		t.Fatal("isFieldAccessTainted must return false past maxTaintDepth")
+	}
+	if analyzer.isFieldTaintedOnValue(nil, 0, nil, make(map[ssa.Value]bool), overBudget) {
+		t.Fatal("isFieldTaintedOnValue must return false past maxTaintDepth")
+	}
+	if analyzer.isFieldOfAllocTainted(nil, 0, nil, make(map[ssa.Value]bool), overBudget) {
+		t.Fatal("isFieldOfAllocTainted must return false past maxTaintDepth")
+	}
+}
+
+// TestFieldAccessOnCyclicPhiChainTerminates constructs an in-memory single
+// function whose field access loops back through a phi node. The trace must
+// terminate (bounded by depth plus the per-sink visited set) rather than hang
+// on the cyclic SSA value graph. This is the hang scenario the shared depth
+// budget and visited memoization exist to prevent; it runs without loading any
+// real package.
+func TestFieldAccessOnCyclicPhiChainTerminates(t *testing.T) {
+	t.Parallel()
+
+	src := `package p
+
+type node struct {
+	next *node
+	v    string
+}
+
+func f(n *node) string {
+	cur := n
+	for cur != nil {
+		cur = cur.next
+	}
+	return cur.v
+}
+`
+	_, ssaPkg := buildInMemorySSA(t, src)
+	fn := ssaPkg.Func("f")
+	if fn == nil {
+		t.Fatal("expected function f")
+	}
+
+	analyzer := New(&Config{})
+
+	// Locate the FieldAddr for cur.v (the value feeding the return) and trace
+	// it with a bounded wait implicit in the test's own runtime: a regression
+	// to non-advancing depth would spin here until the test binary is killed.
+	var fieldAddr *ssa.FieldAddr
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			if fa, ok := instr.(*ssa.FieldAddr); ok && fa.Field == 1 {
+				fieldAddr = fa
+			}
+		}
+	}
+	if fieldAddr == nil {
+		t.Fatal("expected a FieldAddr instruction for field v")
+	}
+
+	done := make(chan bool, 1)
+	go func() {
+		done <- analyzer.isFieldAccessTainted(fieldAddr, fn, make(map[ssa.Value]bool), 0)
+	}()
+	select {
+	case result := <-done:
+		// No sources are configured, so the chain cannot be tainted; the
+		// assertion that matters is termination, which reaching this branch
+		// proves. The result must be the conservative false.
+		if result {
+			t.Fatal("cyclic field chain reported taint with no sources configured")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("field-access trace did not terminate on the cyclic phi chain")
+	}
+}

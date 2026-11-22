@@ -21,7 +21,13 @@ import (
 	"golang.org/x/tools/go/ssa"
 )
 
-// maxTaintDepth limits recursion depth to prevent stack overflow on large codebases
+// maxTaintDepth is the single recursion depth budget for every taint-tracing
+// recursion (interprocedural isTainted, the field-access family, and the
+// single-function valueReachableFromParams reachability check). It bounds both
+// stack growth and the runtime on cyclic or wide SSA value graphs, alongside
+// maxCallerEdges which bounds the caller-edge fan-out separately. Keep this as
+// the only depth limit so changing the budget does not require hunting for
+// hard-coded literals.
 const maxTaintDepth = 50
 
 // maxCallerEdges caps the number of incoming call graph edges examined per function
@@ -382,6 +388,15 @@ func (a *Analyzer) analyzeFunctionSinks(fn *ssa.Function) []Result {
 
 			// Check if any of the specified arguments are tainted
 			for _, arg := range argsToCheck {
+				// A fresh visited map per sink argument: it memoizes values
+				// already seen while tracing THIS argument, so it is scoped to
+				// the sink argument, not to individual data-flow paths. A value
+				// reached first through one path is not re-examined via another,
+				// which keeps cyclic SSA graphs terminable and avoids exponential
+				// path blow-up (the same concern maxCallerEdges addresses for
+				// wide CHA graphs). The trade-off is that a value is judged by
+				// whichever traversal reaches it first; caller edges are sorted
+				// (see sortedCallerEdges) so this order dependence is deterministic.
 				if a.isTainted(arg, fn, make(map[ssa.Value]bool), 0) {
 					results = append(results, Result{
 						Sink:    sink,
@@ -533,7 +548,10 @@ func (a *Analyzer) isTainted(v ssa.Value, fn *ssa.Function, visited map[ssa.Valu
 		return false
 	}
 
-	// Prevent infinite recursion
+	// Memoization within one sink-argument trace (see the map created in
+	// Analyze): a value already visited on any path is treated as not
+	// re-taintable. This is per-sink, not per-path — see the comment at the
+	// visited map creation site for the determinism trade-off.
 	if visited[v] {
 		return false
 	}
@@ -1053,6 +1071,12 @@ func (a *Analyzer) isFreeVarTainted(fv *ssa.FreeVar, fn *ssa.Function, visited m
 // This is the core of field-sensitive taint tracking. Rather than treating
 // the entire struct as tainted when any field is tainted, we trace the
 // specific field to see if IT was assigned tainted data.
+//
+// Every recursive step in the field-access family passes depth+1, so each
+// field hop consumes the shared maxTaintDepth budget. Previously the same
+// depth was forwarded unchanged and only the per-sink visited map broke
+// cycles; a cyclic field-access chain (e.g. through phi nodes) now also
+// terminates via the depth bound instead of relying on visited alone.
 func (a *Analyzer) isFieldAccessTainted(fa *ssa.FieldAddr, fn *ssa.Function, visited map[ssa.Value]bool, depth int) bool {
 	if depth > maxTaintDepth {
 		return false
@@ -1065,7 +1089,7 @@ func (a *Analyzer) isFieldAccessTainted(fa *ssa.FieldAddr, fn *ssa.Function, vis
 			return true
 		}
 		// If not a parameter but still a source type, trace the struct origin
-		if a.isTainted(fa.X, fn, visited, depth) {
+		if a.isTainted(fa.X, fn, visited, depth+1) {
 			return true
 		}
 		return false
@@ -1076,31 +1100,31 @@ func (a *Analyzer) isFieldAccessTainted(fa *ssa.FieldAddr, fn *ssa.Function, vis
 	// specific field index was assigned tainted data.
 	if call, ok := fa.X.(*ssa.Call); ok {
 		if callee := call.Call.StaticCallee(); callee != nil && callee.Blocks != nil {
-			return a.isFieldTaintedViaCall(call, fa.Field, callee, fn, visited, depth)
+			return a.isFieldTaintedViaCall(call, fa.Field, callee, fn, visited, depth+1)
 		}
 		// External function — fall back to checking if the call result is tainted
-		return a.isTainted(fa.X, fn, visited, depth)
+		return a.isTainted(fa.X, fn, visited, depth+1)
 	}
 
 	// CASE 3: The struct is from an Extract (multi-return call, e.g., job, err := NewJob(...)).
 	if extract, ok := fa.X.(*ssa.Extract); ok {
 		if call, ok := extract.Tuple.(*ssa.Call); ok {
 			if callee := call.Call.StaticCallee(); callee != nil && callee.Blocks != nil {
-				return a.isFieldTaintedViaCall(call, fa.Field, callee, fn, visited, depth)
+				return a.isFieldTaintedViaCall(call, fa.Field, callee, fn, visited, depth+1)
 			}
 		}
 		// Fall back
-		return a.isTainted(fa.X, fn, visited, depth)
+		return a.isTainted(fa.X, fn, visited, depth+1)
 	}
 
 	// CASE 4: The struct is a local Alloc. Check stores to this specific field.
 	if alloc, ok := fa.X.(*ssa.Alloc); ok {
-		return a.isFieldOfAllocTainted(alloc, fa.Field, fn, visited, depth)
+		return a.isFieldOfAllocTainted(alloc, fa.Field, fn, visited, depth+1)
 	}
 
 	// CASE 5: Pointer dereference (load) — trace through the pointer.
 	if unop, ok := fa.X.(*ssa.UnOp); ok {
-		return a.isFieldAccessOnPointerTainted(unop, fa.Field, fn, visited, depth)
+		return a.isFieldAccessOnPointerTainted(unop, fa.Field, fn, visited, depth+1)
 	}
 
 	// CASE 6: Phi node — field is tainted if tainted on any incoming edge.
@@ -1115,11 +1139,11 @@ func (a *Analyzer) isFieldAccessTainted(fa *ssa.FieldAddr, fn *ssa.Function, vis
 
 	// CASE 7: Nested field access — e.g., job.Rinse.Something
 	if innerFA, ok := fa.X.(*ssa.FieldAddr); ok {
-		return a.isFieldAccessTainted(innerFA, fn, visited, depth)
+		return a.isFieldAccessTainted(innerFA, fn, visited, depth+1)
 	}
 
 	// Default: fall back to checking if the parent struct value is tainted.
-	return a.isTainted(fa.X, fn, visited, depth)
+	return a.isTainted(fa.X, fn, visited, depth+1)
 }
 
 // isFieldTaintedOnValue checks if a specific field of a value is tainted.
@@ -1131,18 +1155,18 @@ func (a *Analyzer) isFieldTaintedOnValue(v ssa.Value, fieldIdx int, fn *ssa.Func
 	switch val := v.(type) {
 	case *ssa.Call:
 		if callee := val.Call.StaticCallee(); callee != nil && callee.Blocks != nil {
-			return a.isFieldTaintedViaCall(val, fieldIdx, callee, fn, visited, depth)
+			return a.isFieldTaintedViaCall(val, fieldIdx, callee, fn, visited, depth+1)
 		}
-		return a.isTainted(v, fn, visited, depth)
+		return a.isTainted(v, fn, visited, depth+1)
 	case *ssa.Extract:
 		if call, ok := val.Tuple.(*ssa.Call); ok {
 			if callee := call.Call.StaticCallee(); callee != nil && callee.Blocks != nil {
-				return a.isFieldTaintedViaCall(call, fieldIdx, callee, fn, visited, depth)
+				return a.isFieldTaintedViaCall(call, fieldIdx, callee, fn, visited, depth+1)
 			}
 		}
-		return a.isTainted(v, fn, visited, depth)
+		return a.isTainted(v, fn, visited, depth+1)
 	case *ssa.Alloc:
-		return a.isFieldOfAllocTainted(val, fieldIdx, fn, visited, depth)
+		return a.isFieldOfAllocTainted(val, fieldIdx, fn, visited, depth+1)
 	case *ssa.Phi:
 		if visited[v] {
 			return false
@@ -1155,14 +1179,14 @@ func (a *Analyzer) isFieldTaintedOnValue(v ssa.Value, fieldIdx int, fn *ssa.Func
 		}
 		return false
 	default:
-		return a.isTainted(v, fn, visited, depth)
+		return a.isTainted(v, fn, visited, depth+1)
 	}
 }
 
 // isFieldOfAllocTainted checks if a specific field of a locally-allocated struct
 // has been assigned tainted data.
 func (a *Analyzer) isFieldOfAllocTainted(alloc *ssa.Alloc, fieldIdx int, fn *ssa.Function, visited map[ssa.Value]bool, depth int) bool {
-	if alloc.Referrers() == nil {
+	if alloc == nil || depth > maxTaintDepth || alloc.Referrers() == nil {
 		return false
 	}
 	for _, ref := range *alloc.Referrers() {
@@ -1190,7 +1214,10 @@ func (a *Analyzer) isFieldOfAllocTainted(alloc *ssa.Alloc, fieldIdx int, fn *ssa
 // isFieldAccessOnPointerTainted handles field access through a pointer dereference.
 func (a *Analyzer) isFieldAccessOnPointerTainted(unop *ssa.UnOp, fieldIdx int, fn *ssa.Function, visited map[ssa.Value]bool, depth int) bool {
 	// Trace through the pointer to find the underlying value
-	return a.isFieldTaintedOnValue(unop.X, fieldIdx, fn, visited, depth)
+	if unop == nil {
+		return false
+	}
+	return a.isFieldTaintedOnValue(unop.X, fieldIdx, fn, visited, depth+1)
 }
 
 // isFieldTaintedViaCall performs interprocedural analysis to check if a specific
@@ -1425,7 +1452,7 @@ func (a *Analyzer) doTaintedArgsFlowToReturn(call *ssa.Call, callee *ssa.Functio
 // any of the specified parameters. This is a lightweight reachability check
 // within a single function body.
 func (a *Analyzer) valueReachableFromParams(v ssa.Value, taintedParams map[*ssa.Parameter]bool, visited map[ssa.Value]bool, depth int) bool {
-	if v == nil || depth > 30 || visited[v] {
+	if v == nil || depth > maxTaintDepth || visited[v] {
 		return false
 	}
 	visited[v] = true
